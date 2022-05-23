@@ -13,6 +13,7 @@ provider:
 
   stage: ${opt:stage, 'dev'}
   region: ${opt:region, 'ap-southeast-1'}
+  
 
   tracing:
     lambda: true
@@ -25,6 +26,8 @@ provider:
     TODOS_CREATED_AT_INDEX: CreatedAtIndex
     ATTACHMENT_S3_BUCKET: serverless-c4-todo-images-duypk5-${self:provider.stage}
     SIGNED_URL_EXPIRATION: 300
+    CONNECTIONS_TABLE: Connections-${self:provider.stage}
+
     # USER_POOL_ID: { Ref: UserPool }
     # CLIENT_ID: { Ref: UserClient }
 
@@ -189,6 +192,54 @@ functions:
           - xray:PutTelemetryRecords
         Resource: 
           - '*'
+  SendUploadNotifications:
+    environment:
+      STAGE: ${self:provider.stage}
+      API_ID:
+        Ref: WebsocketsApi
+    handler: src/lambda/s3/sendNotifications.handler
+    iamRoleStatements:
+      - Effect: Allow
+        Action: 
+          - dynamodb:Scan
+          - dynamodb:PutItem
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.CONNECTIONS_TABLE}
+      - Effect: Allow
+        Action:
+          - s3:PutObject
+          - s3:GetObject
+        Resource: arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*  
+      - Effect: Allow
+        Action: 
+          - execute-api:ManageConnections 
+        Resource: arn:aws:execute-api:${opt:region, self:provider.region}:*:*/*/POST/@connections/{connectionId}
+  
+  ConnectHandler: 
+    handler: src/lambda/websocket/connect.handler
+    events:
+      - websocket:
+          route: $connect
+    iamRoleStatements:
+      - Effect: Allow
+        Action: 
+          - dynamodb:Scan
+          - dynamodb:PutItem
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.CONNECTIONS_TABLE}
+
+  DisconnectHandler: 
+    handler: src/lambda/websocket/disconnect.handler
+    events:
+      - websocket:
+          route: $disconnect
+    iamRoleStatements:
+      - Effect: Allow
+        Action: 
+          - dynamodb:Scan
+          - dynamodb:PutItem
+          - dynamodb:DeleteItem
+        Resource: arn:aws:dynamodb:${opt:region, self:provider.region}:*:table/${self:provider.environment.CONNECTIONS_TABLE}
 resources:
   Resources:
     # Add necessary AWS resources. You will need at least the following AWS resources
@@ -232,6 +283,19 @@ resources:
                 KeyType: RANGE
             Projection:
               ProjectionType: ALL
+    WebSocketConnectionsDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          -
+            AttributeName: id
+            AttributeType: S
+        KeySchema:
+          -
+            AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.CONNECTIONS_TABLE}
 
     # TODO: Complete the bucket properties below.
     # Do not forget to add the CorsConfiguration propoerty
@@ -239,7 +303,10 @@ resources:
       Type: AWS::S3::Bucket
       Properties:
         BucketName: ${self:provider.environment.ATTACHMENT_S3_BUCKET}
-        # NotificationConfiguration:
+        NotificationConfiguration: 
+          LambdaConfigurations:
+            - Event: s3:ObjectCreated:*
+              Function: !GetAtt SendUploadNotificationsLambdaFunction.Arn
         #   TopicConfigurations:
         #     - Event: s3:ObjectCreated:Put
         #       Topic: !Ref ImagesTopic
@@ -273,3 +340,11 @@ resources:
               Action: 's3:*'
               Resource: 'arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}/*'
         Bucket: !Ref AttachmentsBucket
+    SendUploadNotificationsPermission:
+      Type: AWS::Lambda::Permission
+      Properties:
+        Action: lambda:InvokeFunction
+        FunctionName: !Ref SendUploadNotificationsLambdaFunction
+        Principal: s3.amazonaws.com
+        SourceAccount: !Ref AWS::AccountId
+        SourceArn: arn:aws:s3:::${self:provider.environment.ATTACHMENT_S3_BUCKET}
